@@ -20,26 +20,21 @@ def _unique(values: list[Any]) -> list[Any]:
 
 
 def _merge_comment(left: Any, right: Any) -> str | None:
-    """Fusionne deux commentaires non nuls sans les répéter."""
+    """Concatène les commentaires distincts dans l'ordre des fichiers."""
     left_value = left if left not in (None, "") else None
     right_value = right if right not in (None, "") else None
 
     if left_value is None:
         return right_value
 
-    if right_value is None or left_value == right_value:
+    if right_value is None:
         return left_value
 
-    existing_comments = left_value.split(" | ")
-
-    if right_value in existing_comments:
-        return left_value
-
-    return f"{left_value} | {right_value}"
+    return " | ".join(_unique(left_value.split(" | ") + right_value.split(" | ")))
 
 
 def _normalise_meal(meal: dict[str, Any]) -> None:
-    """Déduplique les contenus d'un repas, même sans fusion externe."""
+    """Regroupe les éléments par type et supprime les contenus identiques."""
     elements_by_type: dict[str, dict[str, Any]] = {}
     normalised_elements: list[dict[str, Any]] = []
 
@@ -55,19 +50,19 @@ def _normalise_meal(meal: dict[str, Any]) -> None:
 
         if not element_type:
             copied = deepcopy(element)
-            copied["contenu"] = _unique(contenu)
+            copied["contenu"] = deepcopy(_unique(contenu))
             normalised_elements.append(copied)
             continue
 
         if element_type not in elements_by_type:
             copied = deepcopy(element)
-            copied["contenu"] = _unique(contenu)
+            copied["contenu"] = deepcopy(_unique(contenu))
             elements_by_type[element_type] = copied
             normalised_elements.append(copied)
             continue
 
         current = elements_by_type[element_type]
-        current["contenu"] = _unique(current.get("contenu", []) + contenu)
+        current["contenu"] = _unique(current["contenu"] + deepcopy(contenu))
 
     meal["elements"] = normalised_elements
 
@@ -104,8 +99,7 @@ def _merge_meal(
 
         target_element = elements_by_type[element_type]
         target_element["contenu"] = _unique(
-            target_element.get("contenu", [])
-            + source_element.get("contenu", [])
+            target_element["contenu"] + source_element.get("contenu", [])
         )
 
     target_meal["commentaires"] = _merge_comment(
@@ -218,12 +212,13 @@ def _merge_day(
     source_copy = deepcopy(source_day)
     _normalise_day(source_copy)
 
-    for key in ("jour_semaine", "theme"):
-        if target_day.get(key) in (None, "") and source_copy.get(key) not in (
-            None,
-            "",
-        ):
-            target_day[key] = source_copy[key]
+    if target_day.get("jour_semaine") in (None, ""):
+        target_day["jour_semaine"] = source_copy.get("jour_semaine")
+
+    if target_day.get("theme") != source_copy.get("theme"):
+        target_day["theme"] = _merge_comment(
+            target_day.get("theme"), source_copy.get("theme")
+        )
 
     target_day["ferie"] = bool(target_day.get("ferie", False)) or bool(
         source_copy.get("ferie", False)
@@ -261,8 +256,9 @@ def merge_menu_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
     - une seule entrée par tranche d'âge dans un jour ;
     - union dédupliquée des allergènes ;
     - OR logique sur les régimes ;
-    - union par type sur les éléments des repas ;
-    - concaténation contrôlée des commentaires.
+    - concaténation par type des contenus des repas, sans doublons identiques ;
+    - concaténation des commentaires distincts dans l'ordre des fichiers ;
+    - conservation des différentes périodes.
     """
     result: dict[str, Any] = {
         "etablissement_id": "",
@@ -271,6 +267,7 @@ def merge_menu_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
     days_by_date: dict[str, dict[str, Any]] = {}
+    periods: list[str] = []
 
     for payload in payloads:
         if not isinstance(payload, dict):
@@ -279,8 +276,8 @@ def merge_menu_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
         if not result["etablissement_id"] and payload.get("etablissement_id"):
             result["etablissement_id"] = str(payload["etablissement_id"])
 
-        if not result["periode"] and payload.get("periode"):
-            result["periode"] = str(payload["periode"])
+        if payload.get("periode"):
+            periods.append(str(payload["periode"]))
 
         days = payload.get("jours", [])
 
@@ -310,6 +307,7 @@ def merge_menu_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
 
             _merge_day(days_by_date[date], source_day)
 
+    result["periode"] = " | ".join(_unique(periods))
     result["jours"].sort(key=lambda day: day["date"])
 
     return result
