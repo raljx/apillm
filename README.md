@@ -102,8 +102,24 @@ venv/
 3. `file_extractors.py` extrait le texte.
 4. `analysis_service.py` orchestre le traitement.
 5. `menu_prompt.py` construit les instructions métier.
-6. `llm_client.py` appelle Azure AI Foundry / Azure OpenAI.
-7. L'API retourne la réponse du LLM en JSON.
+6. `llm_client.py` appelle Azure AI Foundry / Azure OpenAI une fois par fichier,
+   séquentiellement, et attend toutes les réponses avant la fusion.
+7. `menu_merger.py` regroupe les jours par date et les tranches d'âge. Pour une
+   même tranche d'âge, les contenus des repas sont concaténés par type dans
+   l'ordre des fichiers, en supprimant les doublons identiques. Les
+   commentaires distincts sont concaténés avec ` | ` ; les allergènes restent uniques et
+   les indicateurs de régime sont combinés par OU logique. Les périodes et les
+   thèmes différents sont conservés avec le séparateur ` | `.
+8. L'API retourne ce JSON structuré dans le champ `analysis` au backoffice.
+   Si un appel LLM échoue ou retourne un JSON invalide, elle renvoie une erreur
+   HTTP 502, sans résultat de menu partiel. Les erreurs d'extraction de fichiers
+   restent signalées dans `errors` ; seuls les fichiers extraits sont analysés.
+
+Tests de régression (sans appel Azure réel) :
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Installation locale Python
 

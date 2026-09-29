@@ -56,7 +56,8 @@ class LLMClient:
         Analyse chaque fichier indépendamment, puis fusionne les JSON en Python.
 
         Le LLM extrait les informations ; le mergeur garantit l'unicité des dates,
-        des tranches d'âge et les règles d'union métier.
+        des tranches d'âge et la concaténation des contenus des repas.
+        Tous les appels doivent réussir avant de construire la réponse finale.
         """
         if not extracted_files:
             raise LLMCallError("Aucun fichier exploitable à analyser.")
