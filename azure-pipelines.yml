@@ -1,0 +1,772 @@
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+      - feature/*
+      - bugfix/*
+
+parameters:
+  - name: targetEnvironment
+    displayName: "Environnement cible"
+    type: string
+    default: itg
+    values:
+      - itg
+      - prp
+      - prod
+
+variables:
+  - group: menu-analyst-aks
+
+  # ----------------------------------------------------------------
+  # APPLICATION
+  # ----------------------------------------------------------------
+  - name: appName
+    value: "menu-analyst-api"
+  - name: releaseName
+    value: "menu-analyst-api-release"
+  - name: helmChartPath
+    value: "helm/menu-analyst-api"
+
+  # Tag immuable de l'image construite par ce pipeline.
+  - name: imageTag
+    value: "$(Build.BuildId)"
+
+  # ----------------------------------------------------------------
+  # AZURE CONTAINER REGISTRY
+  # IMPORTANT :
+  # - acrServiceConnection est une connexion de service Docker Registry
+  #   Azure DevOps pointant vers l'ACR.
+  # - acrLoginServer est le "Login server" de l'ACR.
+  # - acrRepository ne doit pas contenir le nom du registre.
+  # L'identité des clusters AKS doit disposer du rôle AcrPull sur l'ACR.
+  # ----------------------------------------------------------------
+  - name: acrServiceConnection
+    value: "AzureYourMonacoDockerRegistry"
+  - name: acrLoginServer
+    value: "crfrcyourmonacomcocityplt001.azurecr.io"
+
+  # Le dépôt ACR est choisi au lancement du pipeline, selon l'environnement cible.
+  - ${{ if eq(parameters.targetEnvironment, 'itg') }}:
+    - name: acrRepository
+      value: "monaco-city-itg-services-api-menu-analyst"
+    - name: workloadName
+      value: "monaco-city-itg-services-api-menu-analyst"
+  - ${{ if eq(parameters.targetEnvironment, 'prp') }}:
+    - name: acrRepository
+      value: "monaco-city-prp-services-api-menu-analyst"
+    - name: workloadName
+      value: "monaco-city-prp-services-api-menu-analyst"
+  - ${{ if eq(parameters.targetEnvironment, 'prod') }}:
+    - name: acrRepository
+      value: "monaco-city-prod-services-api-menu-analyst"
+    - name: workloadName
+      value: "monaco-city-prod-services-api-menu-analyst"
+
+  # Définir ces variables dans Azure DevOps (Pipeline variables ou variable group) :
+  # aksResourceGroupITG, aksClusterNameITG,
+  # aksResourceGroupPRP, aksClusterNamePRP,
+  # aksResourceGroupPROD, aksClusterNamePROD.
+
+stages:
+  # ================================================================
+  # 1. VALIDATION DU CODE
+  # ================================================================
+  - stage: Validate
+    displayName: "Validation du projet"
+
+    jobs:
+      - job: ValidateProject
+        displayName: "Contrôle structure projet"
+
+        pool:
+          name: "ads_Linux_Proxyfied"
+
+        steps:
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "CONTROLE STRUCTURE PROJET"
+              echo "=========================================="
+
+              echo "PWD : $(pwd)"
+              echo "Sources : $(Build.SourcesDirectory)"
+              echo "Branche : $(Build.SourceBranch)"
+              echo "Commit : $(Build.SourceVersion)"
+
+              echo ""
+              echo "===== FICHIERS DU PROJET ====="
+              find . -maxdepth 5 -type f -print | sort
+
+              FAILED=0
+
+              for FILE in \
+                "Dockerfile" \
+                "requirements.txt" \
+                "app/main.py" \
+                "$(helmChartPath)/Chart.yaml" \
+                "$(helmChartPath)/values.yaml" \
+                "$(helmChartPath)/values-itg.yaml" \
+                "$(helmChartPath)/values-prp.yaml" \
+                "$(helmChartPath)/values-prod.yaml"
+              do
+                echo "Vérification : ${FILE}"
+
+                if [ -f "${FILE}" ]; then
+                  echo "OK : ${FILE}"
+                else
+                  echo "ERREUR : fichier absent : ${FILE}"
+                  FAILED=1
+                fi
+              done
+
+              if [ "${FAILED}" -ne 0 ]; then
+                echo "ECHEC CONTROLE STRUCTURE"
+                exit 1
+              fi
+
+              echo "STRUCTURE PROJET OK"
+
+            displayName: "Contrôle structure projet"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "VALIDATION HELM"
+              echo "=========================================="
+
+              helm version
+              helm lint "$(helmChartPath)"
+
+              for ENV_FILE in values-itg.yaml values-prp.yaml values-prod.yaml
+              do
+                echo "Validation Helm avec ${ENV_FILE}"
+
+                helm lint "$(helmChartPath)" \
+                  -f "$(helmChartPath)/values.yaml" \
+                  -f "$(helmChartPath)/${ENV_FILE}"
+
+                helm template \
+                  "$(releaseName)" \
+                  "$(helmChartPath)" \
+                  --namespace "validation" \
+                  -f "$(helmChartPath)/values.yaml" \
+                  -f "$(helmChartPath)/${ENV_FILE}" \
+                  > "rendered-${ENV_FILE}.yaml"
+
+                test -s "rendered-${ENV_FILE}.yaml"
+                echo "OK : ${ENV_FILE}"
+              done
+
+            displayName: "Validation Helm"
+
+  # ================================================================
+  # 2. BUILD ET PUSH DE L'IMAGE VERS ACR
+  # ================================================================
+  - stage: BuildImage
+    displayName: "Build et push de l'image vers ACR"
+    dependsOn: Validate
+    condition: succeeded()
+
+    jobs:
+      - job: BuildAndPush
+        displayName: "Build et push menu-analyst-api vers ACR"
+
+        pool:
+          name: "ads_Linux_Proxyfied"
+
+        steps:
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "INFORMATIONS BUILD"
+              echo "=========================================="
+
+              echo "Dockerfile : $(Build.SourcesDirectory)/Dockerfile"
+              echo "Registry : $(acrLoginServer)"
+              echo "Repository : $(acrRepository)"
+              echo "Tag : $(imageTag)"
+              echo "Service Connection ACR : $(acrServiceConnection)"
+
+              test -f "$(Build.SourcesDirectory)/Dockerfile"
+              test -f "$(Build.SourcesDirectory)/requirements.txt"
+
+            displayName: "Préparation du build ACR"
+
+          - task: Docker@2
+            displayName: "Build et push image vers ACR"
+            inputs:
+              command: "buildAndPush"
+              containerRegistry: "$(acrServiceConnection)"
+              repository: "$(acrRepository)"
+              Dockerfile: "$(Build.SourcesDirectory)/Dockerfile"
+              buildContext: "$(Build.SourcesDirectory)"
+              tags: |
+                $(imageTag)
+                latest
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "BUILD TERMINE"
+              echo "=========================================="
+
+              echo "Image publiée : $(acrLoginServer)/$(acrRepository):$(imageTag)"
+              echo "Tag : $(imageTag)"
+              echo "L'image a été buildée et poussée vers l'ACR par Docker@2."
+
+            displayName: "Résumé build"
+
+  # ================================================================
+  # 3. DEPLOIEMENT ITG
+  # ================================================================
+  - stage: DeployITG
+    displayName: "Déploiement ITG"
+    dependsOn: BuildImage
+    condition: and(succeeded(), eq('${{ parameters.targetEnvironment }}', 'itg'))
+
+    jobs:
+      - job: DeployITG
+        displayName: "Déploiement menu-analyst-api ITG"
+
+        pool:
+          name: "ads_Linux_Proxyfied"
+
+        variables:
+          envName: "itg"
+          namespace: "monaco-city-itg"
+          valuesFile: "values-itg.yaml"
+
+        steps:
+          - checkout: self
+            clean: true
+
+          # ServiceConnection-AKS-ITG est une connexion Azure Resource Manager (azurerm).
+          # On ne l'utilise donc pas avec Kubernetes@1/kubernetesServiceEndpoint.
+          - task: AzureCLI@2
+            displayName: "Connexion et configuration AKS ITG"
+            inputs:
+              azureSubscription: "ServiceConnection-AKS-ITG"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -euo pipefail
+                set -x
+
+                echo "Connexion Azure ITG OK"
+                az account show
+
+                if [[ -z "${AKS_RESOURCE_GROUP}" || "${AKS_RESOURCE_GROUP}" == '$('* ]] || \
+                   [[ -z "${AKS_CLUSTER_NAME}" || "${AKS_CLUSTER_NAME}" == '$('* ]]; then
+                  echo "Les variables aksResourceGroupITG et aksClusterNameITG doivent être définies dans Azure DevOps."
+                  exit 1
+                fi
+
+                KUBECONFIG_FILE="$(Pipeline.Workspace)/kubeconfig-itg"
+                az aks get-credentials \
+                  --resource-group "${AKS_RESOURCE_GROUP}" \
+                  --name "${AKS_CLUSTER_NAME}" \
+                  --file "${KUBECONFIG_FILE}" \
+                  --overwrite-existing
+
+                chmod 600 "${KUBECONFIG_FILE}"
+                KUBECONFIG="${KUBECONFIG_FILE}" kubectl config current-context
+                echo "##vso[task.setvariable variable=KUBECONFIG]${KUBECONFIG_FILE}"
+            env:
+              AKS_RESOURCE_GROUP: "$(aksResourceGroupITG)"
+              AKS_CLUSTER_NAME: "$(aksClusterNameITG)"
+
+          - bash: |
+              set -euo pipefail
+              set +x
+
+              API_KEY_FILE="$(Agent.TempDirectory)/azure-openai-api-key-itg"
+              umask 077
+              printf '%s' "${AZURE_OPENAI_API_KEY}" > "${API_KEY_FILE}"
+              echo "##vso[task.setvariable variable=azureOpenAIApiKeyFile]${API_KEY_FILE}"
+
+            displayName: "Préparation du secret Azure OpenAI ITG"
+            env:
+              AZURE_OPENAI_API_KEY: "$(azureOpenAIApiKey)"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "VERIFICATION AKS ITG"
+              echo "=========================================="
+
+              kubectl config current-context
+              kubectl cluster-info
+
+              kubectl get namespace "$(namespace)" >/dev/null 2>&1 || \
+                kubectl create namespace "$(namespace)"
+
+              kubectl get namespace "$(namespace)"
+
+            displayName: "Vérification AKS ITG"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "VALIDATION HELM ITG"
+              echo "=========================================="
+
+              helm lint "$(helmChartPath)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)"
+
+              helm template \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --debug > rendered-itg.yaml
+
+              test -s rendered-itg.yaml
+              head -n 100 rendered-itg.yaml
+
+            displayName: "Validation Helm ITG"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "DEPLOIEMENT ITG"
+              echo "=========================================="
+
+              echo "Image ACR : $(acrLoginServer)/$(acrRepository):$(imageTag)"
+              echo "Tag : $(imageTag)"
+              echo "Namespace : $(namespace)"
+
+              helm upgrade \
+                --install \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                --create-namespace \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --wait \
+                --timeout 10m \
+                --atomic \
+                --debug
+
+            displayName: "Déploiement Helm ITG"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              echo "=========================================="
+              echo "VERIFICATIONS ITG"
+              echo "=========================================="
+
+              helm status "$(releaseName)" -n "$(namespace)"
+
+              echo "Deployments :"
+              kubectl get deployments -n "$(namespace)" -o wide --show-labels
+
+              echo "ReplicaSets :"
+              kubectl get replicasets -n "$(namespace)" -o wide
+
+              echo "Pods :"
+              kubectl get pods -n "$(namespace)" -o wide --show-labels
+
+              echo "Services :"
+              kubectl get svc -n "$(namespace)" -o wide
+
+              echo "Ingress :"
+              kubectl get ingress -n "$(namespace)" -o wide || true
+
+              echo "Events :"
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp
+
+            displayName: "Vérifications ITG"
+
+          - bash: |
+              set +e
+              set -x
+
+              echo "=========================================="
+              echo "DIAGNOSTIC ITG"
+              echo "=========================================="
+
+              helm status "$(releaseName)" -n "$(namespace)" || true
+              helm history "$(releaseName)" -n "$(namespace)" || true
+              kubectl get all -n "$(namespace)" -o wide || true
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp || true
+
+              echo "===== LOGS DES PODS ====="
+              PODS="$(kubectl get pods -n "$(namespace)" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+              for POD in ${PODS}
+              do
+                echo "===== POD ${POD} ====="
+                kubectl describe pod "${POD}" -n "$(namespace)" || true
+                kubectl logs "${POD}" -n "$(namespace)" --all-containers=true --tail=200 || true
+                kubectl logs "${POD}" -n "$(namespace)" --all-containers=true --previous --tail=200 || true
+              done
+
+              exit 0
+
+            displayName: "Diagnostic ITG"
+            condition: always()
+
+  # ================================================================
+  # 4. DEPLOIEMENT PRP
+  # ================================================================
+  - stage: DeployPRP
+    displayName: "Déploiement PRP"
+    dependsOn: BuildImage
+    condition: and(succeeded(), eq('${{ parameters.targetEnvironment }}', 'prp'))
+
+    jobs:
+      - job: DeployPRP
+        displayName: "Déploiement menu-analyst-api PRP"
+
+        pool:
+          name: "ads_Linux_Proxyfied"
+
+        variables:
+          envName: "prp"
+          namespace: "monaco-city-prp"
+          valuesFile: "values-prp.yaml"
+
+        steps:
+          - checkout: self
+            clean: true
+
+          # Connexion Azure Resource Manager PRP.
+          - task: AzureCLI@2
+            displayName: "Connexion et configuration AKS PRP"
+            inputs:
+              azureSubscription: "ServiceConnection-AKS-PRP"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -euo pipefail
+                set -x
+
+                echo "Connexion Azure PRP OK"
+                az account show
+
+                if [[ -z "${AKS_RESOURCE_GROUP}" || "${AKS_RESOURCE_GROUP}" == '$('* ]] || \
+                   [[ -z "${AKS_CLUSTER_NAME}" || "${AKS_CLUSTER_NAME}" == '$('* ]]; then
+                  echo "Les variables aksResourceGroupPRP et aksClusterNamePRP doivent être définies dans Azure DevOps."
+                  exit 1
+                fi
+
+                KUBECONFIG_FILE="$(Pipeline.Workspace)/kubeconfig-prp"
+                az aks get-credentials \
+                  --resource-group "${AKS_RESOURCE_GROUP}" \
+                  --name "${AKS_CLUSTER_NAME}" \
+                  --file "${KUBECONFIG_FILE}" \
+                  --overwrite-existing
+
+                chmod 600 "${KUBECONFIG_FILE}"
+                KUBECONFIG="${KUBECONFIG_FILE}" kubectl config current-context
+                echo "##vso[task.setvariable variable=KUBECONFIG]${KUBECONFIG_FILE}"
+            env:
+              AKS_RESOURCE_GROUP: "$(aksResourceGroupPRP)"
+              AKS_CLUSTER_NAME: "$(aksClusterNamePRP)"
+
+          - bash: |
+              set -euo pipefail
+              set +x
+
+              API_KEY_FILE="$(Agent.TempDirectory)/azure-openai-api-key-prp"
+              umask 077
+              printf '%s' "${AZURE_OPENAI_API_KEY}" > "${API_KEY_FILE}"
+              echo "##vso[task.setvariable variable=azureOpenAIApiKeyFile]${API_KEY_FILE}"
+
+            displayName: "Préparation du secret Azure OpenAI PRP"
+            env:
+              AZURE_OPENAI_API_KEY: "$(azureOpenAIApiKey)"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              kubectl config current-context
+              kubectl cluster-info
+              kubectl get namespace "$(namespace)" >/dev/null 2>&1 || \
+                kubectl create namespace "$(namespace)"
+              kubectl get namespace "$(namespace)"
+
+            displayName: "Vérification AKS PRP"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm lint "$(helmChartPath)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)"
+
+              helm template \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --debug > rendered-prp.yaml
+
+              test -s rendered-prp.yaml
+
+            displayName: "Validation Helm PRP"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm upgrade \
+                --install \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                --create-namespace \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --wait \
+                --timeout 10m \
+                --atomic \
+                --debug
+
+            displayName: "Déploiement Helm PRP"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm status "$(releaseName)" -n "$(namespace)"
+              kubectl get deployments -n "$(namespace)" -o wide --show-labels
+              kubectl get pods -n "$(namespace)" -o wide --show-labels
+              kubectl get svc -n "$(namespace)" -o wide
+              kubectl get ingress -n "$(namespace)" -o wide || true
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp
+
+            displayName: "Vérifications PRP"
+
+          - bash: |
+              set +e
+
+              echo "===== DIAGNOSTIC PRP ====="
+              helm status "$(releaseName)" -n "$(namespace)" || true
+              helm history "$(releaseName)" -n "$(namespace)" || true
+              kubectl get all -n "$(namespace)" -o wide || true
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp || true
+              exit 0
+
+            displayName: "Diagnostic PRP"
+            condition: always()
+
+  # ================================================================
+  # 5. DEPLOIEMENT PROD
+  # ================================================================
+  - stage: DeployPROD
+    displayName: "Déploiement PROD"
+    dependsOn: BuildImage
+    condition: and(succeeded(), eq('${{ parameters.targetEnvironment }}', 'prod'))
+
+    jobs:
+      - job: DeployPROD
+        displayName: "Déploiement menu-analyst-api PROD"
+
+        pool:
+          name: "ads_Linux_Proxyfied"
+
+        variables:
+          envName: "prod"
+          namespace: "monaco-city-prod"
+          valuesFile: "values-prod.yaml"
+
+        steps:
+          - checkout: self
+            clean: true
+
+          # Connexion Azure Resource Manager PROD.
+          - task: AzureCLI@2
+            displayName: "Connexion et configuration AKS PROD"
+            inputs:
+              azureSubscription: "sp-tf-sub-monaco-prod-001"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -euo pipefail
+                set -x
+
+                echo "Connexion Azure PROD OK"
+                az account show
+
+                if [[ -z "${AKS_RESOURCE_GROUP}" || "${AKS_RESOURCE_GROUP}" == '$('* ]] || \
+                   [[ -z "${AKS_CLUSTER_NAME}" || "${AKS_CLUSTER_NAME}" == '$('* ]]; then
+                  echo "Les variables aksResourceGroupPROD et aksClusterNamePROD doivent être définies dans Azure DevOps."
+                  exit 1
+                fi
+
+                KUBECONFIG_FILE="$(Pipeline.Workspace)/kubeconfig-prod"
+                az aks get-credentials \
+                  --resource-group "${AKS_RESOURCE_GROUP}" \
+                  --name "${AKS_CLUSTER_NAME}" \
+                  --file "${KUBECONFIG_FILE}" \
+                  --overwrite-existing
+
+                chmod 600 "${KUBECONFIG_FILE}"
+                KUBECONFIG="${KUBECONFIG_FILE}" kubectl config current-context
+                echo "##vso[task.setvariable variable=KUBECONFIG]${KUBECONFIG_FILE}"
+            env:
+              AKS_RESOURCE_GROUP: "$(aksResourceGroupPROD)"
+              AKS_CLUSTER_NAME: "$(aksClusterNamePROD)"
+
+          - bash: |
+              set -euo pipefail
+              set +x
+
+              API_KEY_FILE="$(Agent.TempDirectory)/azure-openai-api-key-prod"
+              umask 077
+              printf '%s' "${AZURE_OPENAI_API_KEY}" > "${API_KEY_FILE}"
+              echo "##vso[task.setvariable variable=azureOpenAIApiKeyFile]${API_KEY_FILE}"
+
+            displayName: "Préparation du secret Azure OpenAI PROD"
+            env:
+              AZURE_OPENAI_API_KEY: "$(azureOpenAIApiKey)"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              kubectl config current-context
+              kubectl cluster-info
+              kubectl get namespace "$(namespace)" >/dev/null 2>&1 || \
+                kubectl create namespace "$(namespace)"
+              kubectl get namespace "$(namespace)"
+
+            displayName: "Vérification AKS PROD"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm lint "$(helmChartPath)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)"
+
+              helm template \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --debug > rendered-prod.yaml
+
+              test -s rendered-prod.yaml
+
+            displayName: "Validation Helm PROD"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm upgrade \
+                --install \
+                "$(releaseName)" \
+                "$(helmChartPath)" \
+                --namespace "$(namespace)" \
+                --create-namespace \
+                -f "$(helmChartPath)/values.yaml" \
+                -f "$(helmChartPath)/$(valuesFile)" \
+                --set fullnameOverride="$(workloadName)" \
+                --set image.repository="$(acrLoginServer)/$(acrRepository)" \
+                --set image.tag="$(imageTag)" \
+                --set-string env.azureOpenAIEndpoint="$(azureOpenAIEndpoint)" \
+                --set-string env.azureOpenAIDeployment="$(azureOpenAIDeployment)" \
+                --set-string env.azureOpenAIApiVersion="$(azureOpenAIApiVersion)" \
+                --set-file secret.azureOpenAIApiKey="$(azureOpenAIApiKeyFile)" \
+                --wait \
+                --timeout 10m \
+                --atomic \
+                --debug
+
+            displayName: "Déploiement Helm PROD"
+
+          - bash: |
+              set -euo pipefail
+              set -x
+
+              helm status "$(releaseName)" -n "$(namespace)"
+              kubectl get deployments -n "$(namespace)" -o wide --show-labels
+              kubectl get pods -n "$(namespace)" -o wide --show-labels
+              kubectl get svc -n "$(namespace)" -o wide
+              kubectl get ingress -n "$(namespace)" -o wide || true
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp
+
+            displayName: "Vérifications PROD"
+
+          - bash: |
+              set +e
+
+              echo "===== DIAGNOSTIC PROD ====="
+              helm status "$(releaseName)" -n "$(namespace)" || true
+              helm history "$(releaseName)" -n "$(namespace)" || true
+              kubectl get all -n "$(namespace)" -o wide || true
+              kubectl get events -n "$(namespace)" --sort-by=.metadata.creationTimestamp || true
+              exit 0
+
+            displayName: "Diagnostic PROD"
+            condition: always()

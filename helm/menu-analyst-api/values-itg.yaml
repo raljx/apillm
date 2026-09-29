@@ -1,0 +1,62 @@
+replicaCount: 1
+
+fullnameOverride: "monaco-city-itg-services-api-menu-analyst"
+
+image:
+  repository: "crfrcyourmonacomcocityplt001.azurecr.io/monaco-city-itg-services-api-menu-analyst"
+  tag: "155356"
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 8000
+
+env:
+  azureOpenAIEndpoint: "https://monaco-prp-ia.services.ai.azure.com/openai/v1/responses"
+  azureOpenAIDeployment: "gpt-5.6-sol"
+  azureOpenAIApiVersion: "2026-07-09"
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+startupProbe:
+  enabled: true
+  path: /api/v1/health
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 18
+
+livenessProbe:
+  enabled: true
+  path: /api/v1/health
+  initialDelaySeconds: 30
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 5
+
+readinessProbe:
+  enabled: true
+  path: /api/v1/ready
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 5
+
+ingress:
+  enabled: true
+  className: "kong"
+  annotations: {}
+  hosts:
+    - host: "mco-itg.yourmco.com"
+      paths:
+        - path: /menu-analyst-api
+          pathType: Prefix
+
+secret:
+  azureOpenAIApiKey: ""

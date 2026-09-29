@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Environnements Python
+.venv
+venv
+env
+
+# Cache Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers d'environnement / secrets
+.env
+.env.*
+!.env.example
+
+# Tests
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Documentation
+README.md
+
+# Helm ne doit pas être envoyé dans l'image
+helm/
+
+# Fichiers temporaires
+*.log
+tmp/
+temp/
+
+# Documents métier éventuellement présents localement
+*.pdf
+*.docx
+*.xlsx
+*.xls
+*.csv

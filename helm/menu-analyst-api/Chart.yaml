@@ -1,0 +1,7 @@
+apiVersion: v2
+name: menu-analyst-api
+description: FastAPI API for document analysis using Azure AI Foundry
+type: application
+
+version: 0.2.0
+appVersion: "1.0.1"
